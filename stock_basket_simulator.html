@@ -2218,7 +2218,7 @@ function simulate(nStocks,capital,addMoney,rebalTimeOn,rebalFreq,rebalDriftOn,re
 
   const totalTaxDivPaid=totalTaxPaid-totalTaxCGPaid;
   return{nStocks,labels,portfolioValues,stockValues,cashValues,cashInterestHistory,totalCashInterest,shareHistory,priceHistory,events,rebalEvents,maxDDPeakIdx,maxDDTroughIdx,maxRecoveryStartIdx,maxRecoveryEndIdx,maxRecoveryWeeks,maxRecoveryDays,
-    totalReturn,cagr,simYears,stdDev,maxDD:maxDD*100,finalVal,totalInvested,
+    totalReturn,cagr,simYears,stdDev,maxDD:maxDD*100,finalVal,totalInvested,cashAllocPct,
     totalTaxPaid,totalDivReceived,totalTaxCGPaid,totalTaxDivPaid,divByStock,
     annualTax,annualTaxCG,annualTaxDiv,annualDiv,basketName,capital,
     finalHoldings,finalCash,divDateMap,splitDateMap,actionsMap};
@@ -4356,19 +4356,26 @@ function ldbExportCsv(){
 // Flat list of all rebalance rows for filter/sort
 let _rebalRows = [];
 
+let _rebalCashAllocPct=0; // module-level so _applyRebalTable can access it
 function renderRebalTable(r){
+  _rebalCashAllocPct=r.cashAllocPct||0;
   // Flatten rebalEvents × detail rows into one array.
-  // Each event gets a CASH row (sortOrder=0) showing pre-existing cash deployed,
-  // followed by SELL rows (sortOrder=1) then BUY rows (sortOrder=2).
   _rebalRows = [];
   (r.rebalEvents||[]).forEach(ev=>{
     const totalSold=(ev.detail||[]).filter(x=>x.action==='sell').reduce((s,x)=>s+Math.abs(x.valueDelta),0);
     // Add CASH row if there was pre-existing cash (dividends) deployed at this rebalance
     if(ev.cashBefore>1){
+      const tv=ev.totalValue||0;
       _rebalRows.push({
         date:ev.weekStr,type:ev.type,action:'cash',ticker:'CASH',
-        valueDelta:ev.cashBefore,sharesDelta:0,price:0,gain:0,gainTax:0,
-        allocBefore:0,allocTarget:0,cgTax:ev.cgTax,totalSold,sortOrder:0,
+        valueDelta:ev.cashBefore,  // amount deployed
+        cashBefore:ev.cashBefore,
+        cashAfter: ev.cashAfter,
+        totalValue:tv,
+        allocBefore:tv>0?ev.cashBefore/tv*100:0,  // cash % before
+        allocAfter: tv>0?ev.cashAfter /tv*100:0,   // cash % after
+        sharesDelta:0,price:0,gain:0,gainTax:0,
+        cgTax:ev.cgTax,totalSold,sortOrder:0,
       });
     }
     (ev.detail||[]).forEach(d=>{
@@ -4430,14 +4437,29 @@ function _applyRebalTable(){
 
     // CASH row — shows pre-existing dividend cash being deployed at this rebalance
     if(row.action==='cash'){
+      const allocBef=row.allocBefore!=null?row.allocBefore.toFixed(1)+'%':'—';
+      const allocAft=row.allocAfter !=null?row.allocAfter .toFixed(1)+'%':'—';
+      const cashAllocTgt=_rebalCashAllocPct>0?_rebalCashAllocPct.toFixed(1)+'%':'—';
       return '<tr style="border-bottom:.5px solid var(--border);'+bg+'">'
         +'<td style="padding:5px 8px;color:var(--text2);white-space:nowrap;font-family:var(--mono);font-size:11px">'+row.date+'</td>'
         +'<td style="padding:5px 8px">'+(TRIGGER_BADGE[row.type]||row.type)+'</td>'
         +'<td style="padding:5px 8px;font-family:var(--mono);font-weight:500;color:var(--teal)">CASH</td>'
         +'<td style="padding:5px 8px;text-align:right"><span class="tag blue" style="font-size:10px;padding:1px 6px">DEPLOY</span></td>'
-        +'<td style="padding:5px 8px;text-align:center;color:var(--text3);font-size:11px" colspan="2">dividends held since last rebalance</td>'
-        +'<td style="padding:5px 8px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--red)">-$'+fmt2(row.valueDelta)+'</td>'
-        +'<td colspan="4" style="padding:5px 8px;text-align:center;color:var(--text3);font-size:11px">deployed into BUY orders below</td>'
+        +'<td style="padding:5px 8px;text-align:right;font-family:var(--mono);font-size:11px">'
+          +'<span style="color:var(--text3);font-size:10px">deployed </span>'
+          +'<span style="color:var(--red)">-$'+fmt2(row.valueDelta)+'</span>'
+        +'</td>'
+        +'<td style="padding:5px 8px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--text2)">'
+          +'<span style="color:var(--text3);font-size:10px">remaining </span>$'+fmt2(row.cashAfter||0)
+        +'</td>'
+        +'<td style="padding:5px 8px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--red)">-$'+fmt2((row.cashBefore||0)-(row.cashAfter||0))+'</td>'
+        +'<td style="padding:5px 8px;text-align:right;color:var(--text3)">—</td>'
+        +'<td style="padding:5px 8px;text-align:right;color:var(--text3)">—</td>'
+        +'<td style="padding:5px 8px;text-align:right;font-family:var(--mono);font-size:11px">'
+          +'<span style="color:var(--amber)">'+allocBef+'</span>'
+          +' → <span style="color:var(--teal)">'+allocAft+'</span>'
+        +'</td>'
+        +'<td style="padding:5px 8px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--text3)">'+cashAllocTgt+'</td>'
         +'</tr>';
     }
 
