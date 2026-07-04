@@ -248,23 +248,24 @@ console.log('\n=== SECTION A: Simulation Engine ===\n');
     r.totalTaxPaid+' vs '+(r.totalTaxCGPaid+r.totalTaxDivPaid));
 }
 
-// A15: full data gap -> should not crash, should handle gracefully
-// FIXED: getPrice() used to throw for the final snapshot week when a ticker had
-// no price within 7 days. It's now consistent with getPriceOrNull()'s ||0 fallback
-// used everywhere else in the engine. The real safety net is validateDataCoverage()
-// (run before simulate() in both runBacktest and startOptimizer) -- this fallback
-// just prevents a hard crash if a gap slips past that check.
+// A15: full data gap -> simulate() should FAIL LOUDLY, not silently produce a
+// wrong number. Per explicit product decision: no data = no result, ever.
+// The real safety net is validateFullCoverage(), which runs BEFORE simulate()
+// in both Run Analysis and the Optimizer and blocks the run entirely with a
+// clear error panel (no bypass). This test confirms the engine itself also
+// throws rather than defaulting to 0, as defense-in-depth if validation is
+// ever skipped or has a gap of its own.
 {
   const am={AAA:makeActionsMap([])}; // no price data at all
-  let crashed=false, r=null;
+  let threw=false, errMsg=null;
   try{
-    r=simulate(
+    simulate(
       [{ticker:'AAA',alloc:100}],10000,0,
       false,'quarterly',false,5,false,
       0,0,'2020-01-01','2021-01-01','test',am,0,0
     );
-  }catch(e){ crashed=true; }
-  check('A15: empty price data does not crash simulate()', !crashed, crashed?'threw exception':'ok');
+  }catch(e){ threw=true; errMsg=e.message; }
+  check('A15: empty price data -> simulate() throws (fails loudly, no silent $0)', threw, threw?('threw: "'+errMsg+'"'):'did NOT throw — silent wrong result risk');
 }
 
 console.log('\n=== SECTION B: Dividend Deduplication (cleanDivs) ===\n');
@@ -344,7 +345,78 @@ console.log('\n=== SECTION D: Formatting ===\n');
   flag('D5: fmtM(2500) -> "'+r+'"', 'Confirm this is the intended format for values in the 1k-1M range.');
 }
 
-// ─── Summary ─────────────────────────────────────────────────────────────────
+console.log('\n=== SECTION F: Strict Data Coverage Validation ===\n');
+{
+  // Need validateFullCoverage + generateWeeks/utcDateStr from sut.js — re-extract
+  // it here since it lives outside simulate() in the app; for the test suite we
+  // reimplement a thin wrapper using the same exported primitives to verify the
+  // *contract* (every week must resolve within ±7 days) rather than duplicate
+  // the exact implementation.
+  function validateFullCoverageTest(startDate,endDate,tickerList,actionsMap){
+    const weeks=generateWeeks(startDate,endDate);
+    const TOL=7*86400000;
+    const gaps=[];
+    tickerList.forEach(t=>{
+      const prices=(actionsMap[t]&&actionsMap[t].prices)||[];
+      if(!prices.length){ gaps.push({ticker:t,weeksMissing:weeks.length}); return; }
+      const times=prices.map(p=>new Date(p.date+'T00:00:00Z').getTime()).sort((a,b)=>a-b);
+      let missing=0;
+      weeks.forEach(w=>{
+        const wt=w.getTime();
+        let nearest=Infinity;
+        times.forEach(tm=>{ const d=Math.abs(tm-wt); if(d<nearest) nearest=d; });
+        if(nearest>TOL) missing++;
+      });
+      if(missing>0) gaps.push({ticker:t,weeksMissing:missing});
+    });
+    return gaps;
+  }
+
+  // F1: fully covered ticker -> no gaps reported
+  {
+    const prices=flatPrices('2020-01-01','2021-01-01',100);
+    const gaps=validateFullCoverageTest('2020-01-01','2021-01-01',['AAA'],{AAA:{prices}});
+    check('F1: fully covered ticker -> 0 gaps', gaps.length===0, JSON.stringify(gaps));
+  }
+
+  // F2: ticker with a 6-month hole in the middle -> gap detected
+  {
+    const weeks=generateWeeks('2020-01-01','2021-01-01');
+    const prices=weeks.filter((w,i)=>i<10||i>35).map(w=>({date:utcDateStr(w.getTime()),close:100}));
+    const gaps=validateFullCoverageTest('2020-01-01','2021-01-01',['AAA'],{AAA:{prices}});
+    check('F2: ticker with mid-period hole -> gap detected', gaps.length===1&&gaps[0].weeksMissing>10,
+      JSON.stringify(gaps));
+  }
+
+  // F3: ticker whose data simply ends early (doesn't reach effectiveEnd) -> gap detected
+  // This is exactly the case the OLD bar-to-bar gap check would miss entirely.
+  {
+    const prices=flatPrices('2020-01-01','2020-09-01',100); // stops 4 months before requested end
+    const gaps=validateFullCoverageTest('2020-01-01','2021-01-01',['AAA'],{AAA:{prices}});
+    check('F3: ticker data ending early (short of requested end date) -> gap detected',
+      gaps.length===1&&gaps[0].weeksMissing>10, JSON.stringify(gaps));
+  }
+
+  // F4: two tickers, one fully covered one with a hole -> only the bad one flagged
+  {
+    const goodPrices=flatPrices('2020-01-01','2021-01-01',100);
+    const weeks=generateWeeks('2020-01-01','2021-01-01');
+    const badPrices=weeks.filter((w,i)=>i<20).map(w=>({date:utcDateStr(w.getTime()),close:50}));
+    const gaps=validateFullCoverageTest('2020-01-01','2021-01-01',['GOOD','BAD'],
+      {GOOD:{prices:goodPrices},BAD:{prices:badPrices}});
+    check('F4: only the ticker with the actual hole is flagged', gaps.length===1&&gaps[0].ticker==='BAD',
+      JSON.stringify(gaps));
+  }
+
+  // F5: ticker with completely empty price array -> flagged with full week count
+  {
+    const gaps=validateFullCoverageTest('2020-01-01','2021-01-01',['EMPTY'],{EMPTY:{prices:[]}});
+    check('F5: empty price array -> flagged, weeksMissing == total weeks', gaps.length===1&&gaps[0].weeksMissing>=51,
+      JSON.stringify(gaps));
+  }
+}
+
+
 console.log('\n' + '='.repeat(60));
 console.log(`RESULTS: ${pass} passed, ${fail} failed, ${flagged.length} flagged for review`);
 console.log('='.repeat(60));

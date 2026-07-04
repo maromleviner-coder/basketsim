@@ -1813,13 +1813,17 @@ function simulate(nStocks,capital,addMoney,rebalTimeOn,rebalFreq,rebalDriftOn,re
     return best; // may still be null if no price within 7 days
   }
 
-  // Used only for the final snapshot. Falls back to 0 like every other price
-  // lookup in this engine — the validateDataCoverage() check run before simulate()
-  // is the real safety net; this fallback just prevents a hard crash if a gap
-  // slips through (e.g. an optimizer walk-forward window edge that validation
-  // didn't cover) rather than throwing and discarding the whole result.
+  // Used only for the final snapshot. Deliberately throws rather than falling
+  // back to 0 or any other placeholder — validateFullCoverage() (run before
+  // simulate() in both Run Analysis and the Optimizer) guarantees every
+  // simulated week has real data, so this should never fire in practice.
+  // If it ever does, that means validation was bypassed or has a gap of its
+  // own — failing loudly here surfaces that immediately instead of quietly
+  // producing a wrong number with no indication anything was off.
   function getPrice(ticker,weekStr){
-    return getPriceOrNull(ticker,weekStr)||0;
+    const p=getPriceOrNull(ticker,weekStr);
+    if(p!=null) return p;
+    throw new Error('No price data for '+ticker+' at '+weekStr+' — this should have been caught by validateFullCoverage() before simulate() ran.');
   }
 
   // Returns the first available date for a ticker (its "listing date" in our data)
@@ -2233,60 +2237,105 @@ function simulate(nStocks,capital,addMoney,rebalTimeOn,rebalFreq,rebalDriftOn,re
 // Scans each ticker's stored prices for gaps > 21 days (likely a failed fetch chunk).
 // Used by BOTH runBacktest() and startOptimizer() so neither can silently run
 // (or silently discard candidates) on data with holes in it.
-function validateDataCoverage(tickerList,actionsMap){
+// Strict, exhaustive check: every week that WILL actually be simulated
+// (from startDate to endDate) must resolve to a real price for every ticker.
+// This is deliberately stricter than "gaps between stored bars > N days" —
+// it also catches cases where a ticker's data simply doesn't extend far
+// enough to cover the requested date range, which a bar-to-bar gap check
+// would miss entirely. No tolerance, no bypass: if any week is missing for
+// any ticker, the analysis must not run — a partial/interpolated result
+// would be silently wrong and there's no way to tell from the output alone.
+function validateFullCoverage(startDate,endDate,tickerList,actionsMap){
+  const weeks=generateWeeks(startDate,endDate);
+  const TOLERANCE_MS=7*86400000; // same ±7 day tolerance the engine itself uses
   const gapWarnings=[];
+
   tickerList.forEach(s=>{
     const ac=actionsMap[s.ticker];
-    if(!ac||!ac.prices||ac.prices.length<2) return;
-    for(let i=1;i<ac.prices.length;i++){
-      const prev=new Date(ac.prices[i-1].date+'T00:00:00Z').getTime();
-      const curr=new Date(ac.prices[i  ].date+'T00:00:00Z').getTime();
-      const gapDays=(curr-prev)/86400000;
-      if(gapDays>21){ // >3 weeks = likely a missing chunk, not just holidays
+    const prices=(ac&&ac.prices)||[];
+    if(!prices.length){
+      gapWarnings.push({ticker:s.ticker,from:startDate,to:endDate,days:weeks.length*7,weeksMissing:weeks.length});
+      return;
+    }
+    const priceTimes=prices.map(p=>new Date(p.date+'T00:00:00Z').getTime());
+    priceTimes.sort((a,b)=>a-b);
+
+    let gapStartMs=null,gapEndMs=null,missingInRun=0;
+    const flushGap=()=>{
+      if(gapStartMs!=null){
         gapWarnings.push({
           ticker:s.ticker,
-          from:ac.prices[i-1].date,
-          to:ac.prices[i].date,
-          days:Math.round(gapDays)
+          from:utcDateStr(gapStartMs),
+          to:  utcDateStr(gapEndMs),
+          days:Math.round((gapEndMs-gapStartMs)/86400000)+7,
+          weeksMissing:missingInRun,
         });
       }
-    }
+      gapStartMs=null;gapEndMs=null;missingInRun=0;
+    };
+
+    weeks.forEach(w=>{
+      const wt=w.getTime();
+      // Binary search for nearest stored price time
+      let lo=0,hi=priceTimes.length-1,nearest=Infinity;
+      while(lo<=hi){
+        const mid=(lo+hi)>>1;
+        const diff=Math.abs(priceTimes[mid]-wt);
+        if(diff<nearest) nearest=diff;
+        if(priceTimes[mid]<wt) lo=mid+1; else hi=mid-1;
+      }
+      // Also check neighbors around the binary-search landing point (handles ties)
+      const landIdx=lo;
+      for(let k=Math.max(0,landIdx-2);k<=Math.min(priceTimes.length-1,landIdx+2);k++){
+        nearest=Math.min(nearest,Math.abs(priceTimes[k]-wt));
+      }
+      if(nearest>TOLERANCE_MS){
+        if(gapStartMs==null) gapStartMs=wt;
+        gapEndMs=wt;
+        missingInRun++;
+      } else {
+        flushGap();
+      }
+    });
+    flushGap();
   });
   return gapWarnings;
 }
 
-// Renders the gap-warning panel HTML (shared markup for backtest + optimizer)
-function renderGapWarningPanel(gapWarnings,onOpenDb,onRunAnyway){
+// Renders the gap-warning panel HTML (shared markup for backtest + optimizer).
+// This is a HARD STOP — there is deliberately no "run anyway" bypass. Running
+// with incomplete data would silently produce a wrong result (e.g. portfolio
+// value computed with $0 for missing weeks) with no indication in the output
+// that anything was wrong. The only way forward is to fix the data.
+function renderGapWarningPanel(gapWarnings,onOpenDb){
+  const totalMissing=gapWarnings.reduce((s,g)=>s+(g.weeksMissing||0),0);
   const gapList=gapWarnings.map(g=>
     `<div style="padding:7px 10px;background:var(--bg3);border-radius:var(--radius-sm);margin-bottom:6px;font-size:12px">
-      <span style="font-family:var(--mono);font-weight:600;color:var(--amber)">${g.ticker}</span>
-      <span style="color:var(--text2);margin-left:10px">Price data gap: <b>${g.from}</b> → <b>${g.to}</b> (${g.days} days missing)</span>
+      <span style="font-family:var(--mono);font-weight:600;color:var(--red)">${g.ticker}</span>
+      <span style="color:var(--text2);margin-left:10px">Missing: <b>${g.from}</b> → <b>${g.to}</b> (${g.weeksMissing||0} week${(g.weeksMissing||0)!==1?'s':''} with no price data)</span>
     </div>`
   ).join('');
   return `
-    <div style="background:var(--amber-dim);border:.5px solid var(--amber);border-radius:var(--radius);padding:1.5rem">
+    <div style="background:var(--red-dim);border:.5px solid var(--red);border-radius:var(--radius);padding:1.5rem">
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:1rem">
-        <i class="ti ti-database-x" style="font-size:24px;color:var(--amber)"></i>
+        <i class="ti ti-database-x" style="font-size:24px;color:var(--red)"></i>
         <div>
-          <div style="font-size:15px;font-weight:600;color:var(--amber)">Price data gaps detected</div>
+          <div style="font-size:15px;font-weight:600;color:var(--red)">Cannot run — price data is incomplete</div>
           <div style="font-size:12px;color:var(--text2);margin-top:2px">
-            One or more fetch chunks failed during data collection. Running with gaps
-            causes wrong results (portfolio value can drop to $0, or the optimizer may
-            silently discard affected walk-forward windows).
+            ${totalMissing} week${totalMissing!==1?'s':''} across ${gapWarnings.length} ticker${gapWarnings.length!==1?'s':''} have no resolvable price.
+            Running with missing data would silently produce wrong numbers (e.g. treating a missing week as $0) —
+            there is no "run anyway" option because the result would be misleading with no way to tell from the output.
           </div>
         </div>
       </div>
       ${gapList}
       <div style="font-size:12px;color:var(--text2);margin:.75rem 0">
-        Go to the <b>Local Database</b> tab, select the affected ticker, and click <b>Fetch / refresh</b>
-        (or use <b>Find gaps</b> to fetch just the missing range). Then run again.
+        Go to the <b>Local Database</b> tab, select each affected ticker, and use <b>Find gaps</b> → <b>Fetch</b>
+        to fill in the missing weeks. Then run again.
       </div>
       <div style="display:flex;gap:10px;flex-wrap:wrap">
         <button class="btn primary" onclick="${onOpenDb}">
           <i class="ti ti-database"></i> Open Local Database
-        </button>
-        <button class="btn" onclick="${onRunAnyway}">
-          <i class="ti ti-player-play"></i> Run anyway (not recommended)
         </button>
       </div>
     </div>`;
@@ -2400,22 +2449,6 @@ async function runBacktest(){
     if(runStatusEl) runStatusEl.innerHTML='<span style="color:var(--green)">&#x2713; All data loaded from local database</span>';
   }
 
-  // ── Validate price continuity — detect gaps in stored data ──────────────────
-  const gapWarnings=validateDataCoverage(norm,actionsMap);
-  if(gapWarnings.length>0){
-    if(runStatusEl) runStatusEl.style.display='none';
-    document.getElementById('backtest-empty').style.display='none';
-    document.getElementById('fetch-error-panel').style.display='block';
-    document.getElementById('fetch-error-panel').innerHTML=renderGapWarningPanel(
-      gapWarnings,
-      "clearFetchError();showLocalDb()",
-      "clearFetchError();runBacktest()"
-    );
-    showTab('backtest');
-    btn.disabled=false;
-    return;
-  }
-
   // ── Clamp dates to intersection of all tickers' data ─────────────────────
   const dateRanges=norm.map(s=>{
     const ac=actionsMap[s.ticker];
@@ -2430,6 +2463,21 @@ async function runBacktest(){
   if(effectiveStart>effectiveEnd){
     if(runStatusEl) runStatusEl.innerHTML='<span style="color:var(--red)">&#x26A0; No overlapping data period</span>';
     toast('No common date range for all tickers — check Data Collection');
+    btn.disabled=false;
+    return;
+  }
+
+  // ── Validate price continuity — every simulated week must have a price ─────
+  const gapWarnings=validateFullCoverage(effectiveStart,effectiveEnd,norm,actionsMap);
+  if(gapWarnings.length>0){
+    if(runStatusEl) runStatusEl.style.display='none';
+    document.getElementById('backtest-empty').style.display='none';
+    document.getElementById('fetch-error-panel').style.display='block';
+    document.getElementById('fetch-error-panel').innerHTML=renderGapWarningPanel(
+      gapWarnings,
+      "clearFetchError();showLocalDb()"
+    );
+    showTab('backtest');
     btn.disabled=false;
     return;
   }
@@ -5269,22 +5317,6 @@ async function startOptimizer(){
   });
   if(missing.length){toast('Missing data for: '+missing.join(', ')+' — fetch first');return;}
 
-  // ── Validate price continuity — same check used by Run Analysis ────────────
-  // Without this, gaps would either crash individual walk-forward windows
-  // (silently discarded by the try/catch below) or bias the search results
-  // without any visible indication of why.
-  const optGapWarnings=validateDataCoverage(stocks,actionsMap);
-  if(optGapWarnings.length>0){
-    document.getElementById('opt-gap-panel').style.display='block';
-    document.getElementById('opt-gap-panel').innerHTML=renderGapWarningPanel(
-      optGapWarnings,
-      "showLocalDb()",
-      "document.getElementById('opt-gap-panel').style.display='none';startOptimizer()"
-    );
-    return;
-  }
-  document.getElementById('opt-gap-panel').style.display='none';
-
   // Clamp dates
   const dateRanges=stocks.map(s=>{
     const ac=actionsMap[s.ticker];
@@ -5299,6 +5331,21 @@ async function startOptimizer(){
   if(effectiveStart>effectiveEnd){
     toast('No overlapping data period for all tickers');return;
   }
+
+  // ── Validate price continuity — every simulated week must have a price ─────
+  // No bypass: a partial result computed with missing weeks treated as $0
+  // would be silently wrong, and there's no way to tell from the output alone.
+  const optGapWarnings=validateFullCoverage(effectiveStart,effectiveEnd,stocks,actionsMap);
+  if(optGapWarnings.length>0){
+    document.getElementById('opt-gap-panel').style.display='block';
+    document.getElementById('opt-gap-panel').innerHTML=renderGapWarningPanel(
+      optGapWarnings,
+      "showLocalDb()"
+    );
+    return;
+  }
+  document.getElementById('opt-gap-panel').style.display='none';
+
   if(effectiveStart!==startDate||effectiveEnd!==endDate){
     document.getElementById('opt-status').textContent=
       'Dates adjusted: '+effectiveStart+' → '+effectiveEnd+' (based on available DB data)';
@@ -5357,7 +5404,7 @@ async function startOptimizer(){
 
   const startMs=Date.now();
   const limitMs=optMinutes*60*1000;
-  let iter=0, improvements=0;
+  let iter=0, improvements=0, candidateErrors=0, lastCandidateError=null;
   let currentBest=null, currentBestScore=-Infinity;
 
   const PERTURB_EVERY=10; // hill-climb every N iterations
@@ -5387,11 +5434,31 @@ async function startOptimizer(){
           cand.rebalTimeOn,cand.rebalFreq,cand.rebalDriftOn,cand.rebalThresh,cand.rebalDriftRelative,
           taxCG,taxDiv,win.start,win.end,'opt',actionsMap,
           cand.cashAllocPct,cashYieldPct);
-      }catch(e){valid=false;break;}
+      }catch(e){
+        valid=false;
+        candidateErrors++;
+        lastCandidateError=e.message;
+        break;
+      }
       const s=_optScore(r,weightValue);
       if(worstR===null||s<worstScore){worstScore=s;worstR=r;}
     }
-    if(!valid||!worstR){iter++;continue;}
+    if(!valid||!worstR){
+      iter++;
+      // With full-coverage validation run upfront, this should not happen from
+      // missing data. If it keeps happening anyway, something else is wrong —
+      // stop and surface it clearly rather than silently discarding candidates
+      // and returning results that quietly excluded an unknown number of them.
+      if(candidateErrors>=5){
+        _optRunning=false;
+        document.getElementById('opt-status').innerHTML=
+          '<span style="color:var(--red)">Stopped: '+candidateErrors+' candidates failed with the same error — '+
+          '"'+lastCandidateError+'". This should not happen after data validation passed; '+
+          'please report this. Best results found so far (if any) are shown below.</span>';
+        break;
+      }
+      continue;
+    }
 
     // Score based on worst window
     const score=worstScore;

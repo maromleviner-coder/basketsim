@@ -120,13 +120,17 @@ function simulate(nStocks,capital,addMoney,rebalTimeOn,rebalFreq,rebalDriftOn,re
     return best; // may still be null if no price within 7 days
   }
 
-  // Used only for the final snapshot. Falls back to 0 like every other price
-  // lookup in this engine — the validateDataCoverage() check run before simulate()
-  // is the real safety net; this fallback just prevents a hard crash if a gap
-  // slips through (e.g. an optimizer walk-forward window edge that validation
-  // didn't cover) rather than throwing and discarding the whole result.
+  // Used only for the final snapshot. Deliberately throws rather than falling
+  // back to 0 or any other placeholder — validateFullCoverage() (run before
+  // simulate() in both Run Analysis and the Optimizer) guarantees every
+  // simulated week has real data, so this should never fire in practice.
+  // If it ever does, that means validation was bypassed or has a gap of its
+  // own — failing loudly here surfaces that immediately instead of quietly
+  // producing a wrong number with no indication anything was off.
   function getPrice(ticker,weekStr){
-    return getPriceOrNull(ticker,weekStr)||0;
+    const p=getPriceOrNull(ticker,weekStr);
+    if(p!=null) return p;
+    throw new Error('No price data for '+ticker+' at '+weekStr+' — this should have been caught by validateFullCoverage() before simulate() ran.');
   }
 
   // Returns the first available date for a ticker (its "listing date" in our data)
