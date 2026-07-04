@@ -119,3 +119,64 @@
 
 ### GitHub
 Repository: [https://github.com/maromleviner-coder/basketsim](https://github.com/maromleviner-coder/basketsim)
+
+---
+
+## Session: July 2026 — Post-commit fixes
+
+### Cash Allocation — Normalization Overhaul
+- **Unified normalization** — Stocks and cash are now all treated as percentages of the full portfolio (sum to 100% together). Previously stocks were normalized to 100% independently and cash was a separate parameter, causing inconsistencies in initial purchase, rebalance targets, and monthly injection amounts.
+- **Initial purchase** — Each stock gets `capital × alloc%` directly. Cash gets `capital × cashAllocPct%`. No more two-stage "reserve cash first, split rest among stocks".
+- **Monthly injection** — Cash portion of monthly additions goes to cash balance (`addMoney × cashAllocPct%`). Stocks get their direct alloc% of addMoney.
+- **`runBacktest` normalization** — `grandTotal = stockTotal + cashHighPct`. All allocs normalized by `grandTotal` so stocks + cash always sum to 100%.
+- **`applyOptResult` scaling** — When applying optimizer results, stock allocs are scaled by `(100 - cashPct) / 100` so the builder total display shows exactly 100%.
+
+### Cash Interest — Date Fix
+- **Last bar of calendar month** — Interest now fires on the last weekly bar of each calendar month (detected by next week crossing into a new month), not every 4 weeks. This ensures exactly one payment per month on the correct date.
+- **Actual cash balance** — Interest is computed on `Math.max(0, cash)` (the real cash balance), not on `portfolioValue × cashAllocPct%` (the estimated target reserve). This prevents interest from fluctuating with stock prices.
+
+### Tax & Dividends Charts — Data Fix
+- **`weeklyTaxCG` never populated** — CG tax from rebalance sells was updating `totalTaxCGPaid` but not writing to `weeklyTaxCG[wi]`. Fixed by adding `weeklyTaxCG[wi] += t` inside the sell loop.
+- **`weeklyDiv` and `weeklyTaxDiv` never populated** — Stock dividend income was not writing to per-week arrays. Fixed by adding `weeklyDiv[wi] += net` and `weeklyTaxDiv[wi] += tax` in the dividend processing block.
+- **Double-write bug** — All three arrays (`weeklyTaxCG`, `weeklyDiv`, `weeklyTaxDiv`) were using both sparse `wi`-indexed assignment AND `.push()`. The push caused annual aggregation to count values twice (or at wrong indices). Removed all `.push()` calls — sparse index assignment is now the only write path.
+- **Tax charts always linear** — Log scale toggle on portfolio chart was accidentally propagating to tax charts. Tax charts now always use linear scale (log scale fails silently when values are zero).
+
+### Portfolio Chart — Log/Linear Toggle
+- **Linear/Log buttons** — Top-right of the portfolio chart card. Log scale makes early-year movements visible when the portfolio grows 10×+ over the simulation period. Stored in `window._chartMainScale`.
+
+### CAGR — Added Everywhere
+- **`fmtReturn(totalReturn, cagr)`** — New helper formats as `+138.3% (+14.2%/yr)`.
+- **CAGR computation** — `(finalVal / totalInvested)^(1/simYears) - 1` using actual calendar years between start and end dates.
+- **Displayed in** — Backtest metrics total return card, save basket modal, compare baskets table, optimizer result cards (both worst-window and full-period rows).
+
+### Max Recovery Period
+- **Algorithm** — For each week `i`, finds the first week `j > i` where portfolio ≥ `portfolioValues[i]` after a dip. Longest such span = max recovery.
+- **Metric card** — Shown in amber in the backtest summary metrics.
+- **Purple band** — Shaded region on portfolio chart from recovery start to end.
+- **Diamond markers** — Purple diamonds at start and end of the worst recovery period.
+
+### Rebalance History — CASH DEPLOY Row
+- **VALUE Δ column** — Shows `cashBefore - cashAfter` (actual cash outflow from the balance), in red.
+- **ALLOC BEFORE column** — Shows cash % before rebalance (amber) → cash % after (teal).
+- **TARGET column** — Shows the configured cash allocation target %.
+- **PRICE column** — Shows remaining cash after the deployment.
+- **Sign fix** — CASH DEPLOY value was showing `+` (misleading); now shows `-` (cash leaving the balance).
+- **Scope fix** — `r.cashAllocPct` was out of scope in `_applyRebalTable`. Fixed via module-level `_rebalCashAllocPct` variable set when `renderRebalTable(r)` is called.
+
+### Optimizer — Walk-forward Scoring Fix
+- **Best Value uses full-period return** — Previously all three cards used worst-window final value. Now Best Value tracks `fullR.finalVal` (full simulation period), while Best Recovery and Best Balanced use worst-window scores. This prevents Best Recovery from paradoxically beating Best Value on total return.
+- **Card subtitles** — Each card now shows a subtitle explaining what it optimizes: *(highest full-period return)*, *(shortest worst-window recovery)*, *(best worst-window score)*.
+- **Full-period cached** — `_runFull()` is computed once per new best and cached as `_cachedFullR` to avoid redundant simulate() calls.
+- **`applyOptResult` onclick** — Fixed JSON-in-onclick quoting bug using `_optCandStore` / `_optStoreCand` / `_optApply` pattern. Candidates stored by timestamp key; onclick passes only the key string.
+
+### Event Log
+- **All events shown** — Removed 300-event truncation (`slice(-300)`). Full history available.
+- **Filter controls** — Text search, type dropdown (DIV/REB/BUY/SPLIT), Show All checkbox.
+- **Pagination** — Default 200 events shown; "Show more" loads 200 more at a time.
+- **Count** — Header shows total, filtered count, and shown count.
+
+### No-op Rebalance Logging
+- **"No action needed"** — When a time-based rebalance fires but all allocations are already at target, logs current allocations with deviation from target (e.g. `SCHD 33.2%-0.2pp, QQQ 33.4%+0.1pp`) instead of silent skip or misleading "0 sold, 0 bought".
+
+### Rebalance Event Log Detail
+- Shows actual shares and dollar values per ticker: `sold: QQQ -5022.361sh (-$1,129,328.10) | bought: BRK-B +2205.894sh (+$390,068.21)`.
