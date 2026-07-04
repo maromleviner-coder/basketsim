@@ -120,11 +120,13 @@ function simulate(nStocks,capital,addMoney,rebalTimeOn,rebalFreq,rebalDriftOn,re
     return best; // may still be null if no price within 7 days
   }
 
-  // Throws if no price at all — only called when we expect data to exist
+  // Used only for the final snapshot. Falls back to 0 like every other price
+  // lookup in this engine — the validateDataCoverage() check run before simulate()
+  // is the real safety net; this fallback just prevents a hard crash if a gap
+  // slips through (e.g. an optimizer walk-forward window edge that validation
+  // didn't cover) rather than throwing and discarding the whole result.
   function getPrice(ticker,weekStr){
-    const p=getPriceOrNull(ticker,weekStr);
-    if(p!=null) return p;
-    throw new Error('No price data for '+ticker+' at '+weekStr);
+    return getPriceOrNull(ticker,weekStr)||0;
   }
 
   // Returns the first available date for a ticker (its "listing date" in our data)

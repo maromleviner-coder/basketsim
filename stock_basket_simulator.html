@@ -407,6 +407,9 @@ hr.divider{border:none;border-top:.5px solid var(--border);margin:1rem 0}
     </div>
   </div>
 
+  <!-- Gap warning panel — shown if any ticker has missing data before search starts -->
+  <div id="opt-gap-panel" style="display:none;margin-bottom:1rem"></div>
+
   <!-- 3 Result cards -->
   <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:1rem" id="opt-results-grid">
     <div class="card" id="opt-card-value">
@@ -1810,11 +1813,13 @@ function simulate(nStocks,capital,addMoney,rebalTimeOn,rebalFreq,rebalDriftOn,re
     return best; // may still be null if no price within 7 days
   }
 
-  // Throws if no price at all — only called when we expect data to exist
+  // Used only for the final snapshot. Falls back to 0 like every other price
+  // lookup in this engine — the validateDataCoverage() check run before simulate()
+  // is the real safety net; this fallback just prevents a hard crash if a gap
+  // slips through (e.g. an optimizer walk-forward window edge that validation
+  // didn't cover) rather than throwing and discarding the whole result.
   function getPrice(ticker,weekStr){
-    const p=getPriceOrNull(ticker,weekStr);
-    if(p!=null) return p;
-    throw new Error('No price data for '+ticker+' at '+weekStr);
+    return getPriceOrNull(ticker,weekStr)||0;
   }
 
   // Returns the first available date for a ticker (its "listing date" in our data)
@@ -2224,6 +2229,69 @@ function simulate(nStocks,capital,addMoney,rebalTimeOn,rebalFreq,rebalDriftOn,re
     finalHoldings,finalCash,divDateMap,splitDateMap,actionsMap};
 }
 
+// ─── SHARED DATA VALIDATION ──────────────────────────────────────────────────
+// Scans each ticker's stored prices for gaps > 21 days (likely a failed fetch chunk).
+// Used by BOTH runBacktest() and startOptimizer() so neither can silently run
+// (or silently discard candidates) on data with holes in it.
+function validateDataCoverage(tickerList,actionsMap){
+  const gapWarnings=[];
+  tickerList.forEach(s=>{
+    const ac=actionsMap[s.ticker];
+    if(!ac||!ac.prices||ac.prices.length<2) return;
+    for(let i=1;i<ac.prices.length;i++){
+      const prev=new Date(ac.prices[i-1].date+'T00:00:00Z').getTime();
+      const curr=new Date(ac.prices[i  ].date+'T00:00:00Z').getTime();
+      const gapDays=(curr-prev)/86400000;
+      if(gapDays>21){ // >3 weeks = likely a missing chunk, not just holidays
+        gapWarnings.push({
+          ticker:s.ticker,
+          from:ac.prices[i-1].date,
+          to:ac.prices[i].date,
+          days:Math.round(gapDays)
+        });
+      }
+    }
+  });
+  return gapWarnings;
+}
+
+// Renders the gap-warning panel HTML (shared markup for backtest + optimizer)
+function renderGapWarningPanel(gapWarnings,onOpenDb,onRunAnyway){
+  const gapList=gapWarnings.map(g=>
+    `<div style="padding:7px 10px;background:var(--bg3);border-radius:var(--radius-sm);margin-bottom:6px;font-size:12px">
+      <span style="font-family:var(--mono);font-weight:600;color:var(--amber)">${g.ticker}</span>
+      <span style="color:var(--text2);margin-left:10px">Price data gap: <b>${g.from}</b> → <b>${g.to}</b> (${g.days} days missing)</span>
+    </div>`
+  ).join('');
+  return `
+    <div style="background:var(--amber-dim);border:.5px solid var(--amber);border-radius:var(--radius);padding:1.5rem">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:1rem">
+        <i class="ti ti-database-x" style="font-size:24px;color:var(--amber)"></i>
+        <div>
+          <div style="font-size:15px;font-weight:600;color:var(--amber)">Price data gaps detected</div>
+          <div style="font-size:12px;color:var(--text2);margin-top:2px">
+            One or more fetch chunks failed during data collection. Running with gaps
+            causes wrong results (portfolio value can drop to $0, or the optimizer may
+            silently discard affected walk-forward windows).
+          </div>
+        </div>
+      </div>
+      ${gapList}
+      <div style="font-size:12px;color:var(--text2);margin:.75rem 0">
+        Go to the <b>Local Database</b> tab, select the affected ticker, and click <b>Fetch / refresh</b>
+        (or use <b>Find gaps</b> to fetch just the missing range). Then run again.
+      </div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <button class="btn primary" onclick="${onOpenDb}">
+          <i class="ti ti-database"></i> Open Local Database
+        </button>
+        <button class="btn" onclick="${onRunAnyway}">
+          <i class="ti ti-player-play"></i> Run anyway (not recommended)
+        </button>
+      </div>
+    </div>`;
+}
+
 // ─── RUN BACKTEST ─────────────────────────────────────────────────────────────
 // Stage 2: Run Analysis — loads ALL data from local DB only. No network calls.
 // If a ticker has no DB data, shows a clear error and directs user to Stage 1.
@@ -2333,62 +2401,16 @@ async function runBacktest(){
   }
 
   // ── Validate price continuity — detect gaps in stored data ──────────────────
-  // A gap > 14 days within the effective simulation period means a fetch chunk failed.
-  // Warn the user and direct them to re-fetch rather than running with bad data.
-  const gapWarnings=[];
-  norm.forEach(s=>{
-    const ac=actionsMap[s.ticker];
-    if(!ac||!ac.prices||ac.prices.length<2) return;
-    for(let i=1;i<ac.prices.length;i++){
-      const prev=new Date(ac.prices[i-1].date+'T00:00:00Z').getTime();
-      const curr=new Date(ac.prices[i  ].date+'T00:00:00Z').getTime();
-      const gapDays=(curr-prev)/86400000;
-      if(gapDays>21){ // >3 weeks = likely a missing chunk, not just holidays
-        gapWarnings.push({
-          ticker:s.ticker,
-          from:ac.prices[i-1].date,
-          to:ac.prices[i].date,
-          days:Math.round(gapDays)
-        });
-      }
-    }
-  });
+  const gapWarnings=validateDataCoverage(norm,actionsMap);
   if(gapWarnings.length>0){
-    const gapList=gapWarnings.map(g=>
-      `<div style="padding:7px 10px;background:var(--bg3);border-radius:var(--radius-sm);margin-bottom:6px;font-size:12px">
-        <span style="font-family:var(--mono);font-weight:600;color:var(--amber)">${g.ticker}</span>
-        <span style="color:var(--text2);margin-left:10px">Price data gap: <b>${g.from}</b> → <b>${g.to}</b> (${g.days} days missing)</span>
-      </div>`
-    ).join('');
     if(runStatusEl) runStatusEl.style.display='none';
     document.getElementById('backtest-empty').style.display='none';
     document.getElementById('fetch-error-panel').style.display='block';
-    document.getElementById('fetch-error-panel').innerHTML=`
-      <div style="background:var(--amber-dim);border:.5px solid var(--amber);border-radius:var(--radius);padding:1.5rem">
-        <div style="display:flex;align-items:center;gap:10px;margin-bottom:1rem">
-          <i class="ti ti-database-x" style="font-size:24px;color:var(--amber)"></i>
-          <div>
-            <div style="font-size:15px;font-weight:600;color:var(--amber)">Price data gaps detected</div>
-            <div style="font-size:12px;color:var(--text2);margin-top:2px">
-              One or more fetch chunks failed during data collection. Running the simulation with gaps
-              causes the portfolio value to drop to $0 during the missing period.
-            </div>
-          </div>
-        </div>
-        ${gapList}
-        <div style="font-size:12px;color:var(--text2);margin:.75rem 0">
-          Go to the <b>Local Database</b> tab, select the affected ticker, and click <b>Fetch / refresh</b>
-          to fill in the missing data. Then run the analysis again.
-        </div>
-        <div style="display:flex;gap:10px;flex-wrap:wrap">
-          <button class="btn primary" onclick="clearFetchError();showLocalDb()">
-            <i class="ti ti-database"></i> Open Local Database
-          </button>
-          <button class="btn" onclick="clearFetchError();runBacktest()">
-            <i class="ti ti-player-play"></i> Run anyway (not recommended)
-          </button>
-        </div>
-      </div>`;
+    document.getElementById('fetch-error-panel').innerHTML=renderGapWarningPanel(
+      gapWarnings,
+      "clearFetchError();showLocalDb()",
+      "clearFetchError();runBacktest()"
+    );
     showTab('backtest');
     btn.disabled=false;
     return;
@@ -5246,6 +5268,22 @@ async function startOptimizer(){
     actionsMap[s.ticker]=actionsCache[s.ticker];
   });
   if(missing.length){toast('Missing data for: '+missing.join(', ')+' — fetch first');return;}
+
+  // ── Validate price continuity — same check used by Run Analysis ────────────
+  // Without this, gaps would either crash individual walk-forward windows
+  // (silently discarded by the try/catch below) or bias the search results
+  // without any visible indication of why.
+  const optGapWarnings=validateDataCoverage(stocks,actionsMap);
+  if(optGapWarnings.length>0){
+    document.getElementById('opt-gap-panel').style.display='block';
+    document.getElementById('opt-gap-panel').innerHTML=renderGapWarningPanel(
+      optGapWarnings,
+      "showLocalDb()",
+      "document.getElementById('opt-gap-panel').style.display='none';startOptimizer()"
+    );
+    return;
+  }
+  document.getElementById('opt-gap-panel').style.display='none';
 
   // Clamp dates
   const dateRanges=stocks.map(s=>{

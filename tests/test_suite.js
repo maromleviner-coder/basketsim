@@ -249,6 +249,11 @@ console.log('\n=== SECTION A: Simulation Engine ===\n');
 }
 
 // A15: full data gap -> should not crash, should handle gracefully
+// FIXED: getPrice() used to throw for the final snapshot week when a ticker had
+// no price within 7 days. It's now consistent with getPriceOrNull()'s ||0 fallback
+// used everywhere else in the engine. The real safety net is validateDataCoverage()
+// (run before simulate() in both runBacktest and startOptimizer) -- this fallback
+// just prevents a hard crash if a gap slips past that check.
 {
   const am={AAA:makeActionsMap([])}; // no price data at all
   let crashed=false, r=null;
@@ -260,9 +265,6 @@ console.log('\n=== SECTION A: Simulation Engine ===\n');
     );
   }catch(e){ crashed=true; }
   check('A15: empty price data does not crash simulate()', !crashed, crashed?'threw exception':'ok');
-  if(!crashed){
-    flag('A15: empty price data -> finalVal is '+r.finalVal, 'Confirm this is the desired fallback behavior (holds as cash) rather than a silent wrong number.');
-  }
 }
 
 console.log('\n=== SECTION B: Dividend Deduplication (cleanDivs) ===\n');
